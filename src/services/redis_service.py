@@ -4,6 +4,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import Optional
 from src.models.patient_db import Patient
+from src.models import Appointment
 from src.services.db_context import db_context
 
 # ✅ Redis connection setup
@@ -35,21 +36,106 @@ def save_caller_profile(profile: CallerProfile, ttl_sec: int = 604800):
     r.setex(_caller_key(profile.phone), ttl_sec, serialized)
     print(f"[Redis] 💾 Saved caller profile for {profile.phone}")
 
-def load_caller_profile(phone: str) -> Optional[CallerProfile]:
-    """Load cached caller profile."""
-    raw = r.get(_caller_key(phone))
-    return CallerProfile(**json.loads(raw)) if raw else None
+def load_caller_profile(phone: str) -> CallerProfile:
+    """
+    Load caller profile with fallback:
+    1. Redis
+    2. DB
+    3. New profile
+    Always returns CallerProfile (never None)
+    """
+
+    key = _caller_key(phone)
+    raw = r.get(key)
+
+    # 1️⃣ Redis
+    if raw:
+        try:
+            data = json.loads(raw)
+            return CallerProfile(**data)
+        except Exception as e:
+            print(f"[Redis] ⚠️ Corrupted profile for {phone}: {e}")
+
+    # 2️⃣ Database
+    with db_context():
+        patient = Patient.query.filter_by(phone=phone).first()
+
+        if patient:
+            latest_appt = (
+                Appointment.query.filter_by(patient_id=patient.id)
+                .order_by(Appointment.date.desc())
+                .first()
+            )
+
+            profile = CallerProfile(
+                name=patient.name,
+                phone=patient.phone,
+                last_appointment={
+                    "date": str(latest_appt.date) if latest_appt else None,
+                    "time": latest_appt.time if latest_appt else None,
+                    "status": latest_appt.status if latest_appt else None,
+                } if latest_appt else None,
+            )
+
+            save_caller_profile(profile)
+            return profile
+
+    # 3️⃣ Completely new caller
+    profile = CallerProfile(phone=phone)
+    save_caller_profile(profile)
+    return profile
+
+def upsert_caller_profile(phone: str, name: Optional[str] = None, last_appointment: Optional[dict] = None, ttl_sec: int = 604800) -> CallerProfile:
+    """
+    Merge-or-create a CallerProfile with provided phone, and optionally name/last_appointment.
+    - Preserves existing fields unless new values are provided.
+    - Updates last_seen timestamp.
+    """
+    if not phone:
+        raise ValueError("phone is required for CallerProfile")
+    existing = load_caller_profile(phone)
+    if existing:
+        if name:
+            existing.name = name
+        if last_appointment:
+            existing.last_appointment = last_appointment
+        existing.last_seen = datetime.utcnow().isoformat()
+        save_caller_profile(existing, ttl_sec=ttl_sec)
+        return existing
+    profile = CallerProfile(
+        name=name,
+        phone=phone,
+        last_appointment=last_appointment,
+    )
+    save_caller_profile(profile, ttl_sec=ttl_sec)
+    return profile
 
 # ✅ Data model for call context
 @dataclass
 class BookingContext:
+    # Caller identity
     name: str | None = None
     phone: str | None = None
+
+    # New booking request (OR new values during reschedule)
     date: str | None = None
     time: str | None = None
     suggested_slots: list[str] | None = None
-    stage: str = "start"
-    status: str = "Pending"
+
+    # State machine
+    stage: str = "start"       # start | collecting_name | collecting_phone | got_time | booking | rescheduling
+    status: str = "Pending"    # Pending | booked | rescheduled
+
+    # 🔄 Reschedule mode fields
+    mode: str = "normal"       # normal | reschedule
+    old_date: str | None = None
+    old_time: str | None = None
+    new_date: str | None = None
+    new_time: str | None = None
+    reschedule_confirmed: bool = False
+    confirmed_identity: bool = False
+
+    # Metadata
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -82,6 +168,16 @@ def save_context(pid: str, ctx: BookingContext, ttl_sec: int = 300):
         print(f"[Redis] ❌ Save error for {pid}: {e}")
         return False
 
+
+
+
+
+
+
+
+
+
+
 # ✅ Delete session context manually
 def clear_context(pid: str):
     r.delete(_key(pid))
@@ -106,67 +202,31 @@ import re
 
 def hydrate_context(caller_id: str, phone: str | None = None) -> BookingContext:
     """
-    Hydrates call memory based on caller_id or phone.
-    Priority:
-    1️⃣ Redis CallerProfile (cached, 24h)
-    2️⃣ DB Patient + Appointment (persistent)
-    3️⃣ Fresh BookingContext (no history)
+    Hydrates session context:
+    - loads CallerProfile (Redis → DB → new)
+    - creates BookingContext for this call
     """
 
-    # 1️⃣ Case: No phone number detected (new SIP or unrecognized caller)
     if not phone:
         ctx = BookingContext(stage="ask_phone", status="Pending")
         save_context(caller_id, ctx)
-        print(f"[Hydrate] 🚫 No phone detected — prompting caller to provide number.")
+        print("[Hydrate] No phone detected — asking caller.")
         return ctx
 
-    # 2️⃣ Check Redis caller profile first
+    # 👉 ALWAYS use load_caller_profile() (never duplicate logic)
     profile = load_caller_profile(phone)
-    if profile:
-        print(f"[Hydrate] 🔁 Loaded caller profile from Redis: {profile.phone}")
 
-    else:
-        # 3️⃣ No Redis profile → check the database
-        with db_context():
-            patient = Patient.query.filter_by(phone=phone).first()
-
-            if not patient:
-                profile = CallerProfile(phone=phone)
-                print(f"[Hydrate] 🆕 New caller — no patient record found for {phone}")
-
-            else:
-                # Fetch last known appointment
-                latest_appt = (
-                    Appointment.query.filter_by(patient_id=patient.id)
-                    .order_by(Appointment.date.desc())
-                    .first()
-                )
-
-                profile = CallerProfile(
-                    name=patient.name,
-                    phone=patient.phone,
-                    last_appointment={
-                        "date": str(latest_appt.date) if latest_appt else None,
-                        "time": latest_appt.time if latest_appt else None,
-                        "status": latest_appt.status if latest_appt else "N/A",
-                    } if latest_appt else None,
-                )
-
-                print(f"[Hydrate] 🧠 Hydrated from DB — patient: {patient.name}")
-
-            # Cache profile (new or existing) in Redis
-            save_caller_profile(profile)
-
-    # 4️⃣ Build session (short-term memory for this call)
+    # Build session from profile
     session = BookingContext(
         name=profile.name,
         phone=profile.phone,
-        date=profile.last_appointment["date"] if profile.last_appointment else None,
-        time=profile.last_appointment["time"] if profile.last_appointment else None,
+        date=None,
+        time=None,
         status="returning" if profile.name else "new",
         stage="start",
     )
 
     save_context(caller_id, session)
-    print(f"[Hydrate] 💾 Saved session context for caller_id={caller_id}")
+
+    print(f"[Hydrate] 💾 Session hydrated for {caller_id}")
     return session

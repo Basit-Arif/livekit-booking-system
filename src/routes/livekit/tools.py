@@ -1,38 +1,77 @@
 from livekit.agents import Agent, AgentSession, JobContext, function_tool
-from src.services.context_manager import _ctx,_save,_clear
+from livekit.agents import get_job_context
+from livekit import api
+from src.services.context_manager import _ctx,_save,_clear, CURRENT_PARTICIPANT
 from pydantic import ValidationError
 from pydantic import BaseModel, Field,validator
 from typing import Optional
 import logging
 from datetime import datetime,timedelta
-from src.services.clinic_service import get_or_create_patient,create_appointment,get_patient_by_phone
+from src.services.clinic_service import get_or_create_patient,create_appointment,get_patient_by_phone,get_upcoming_appointment,reschedule_appointment,get_booked_slots
 from src.services.db_context import db_context
+from extensions import db
+from src.models import Appointment
+import asyncio
+from src.services.redis_service import upsert_caller_profile
+
 logger = logging.getLogger("voice_agent.tools")
 
+async def hangup_call():
+    ctx = get_job_context()
+    if ctx is None:
+        return
+    try:
+        logger.info(f"[end_call] Deleting room: {ctx.room.name}")
+        await ctx.api.room.delete_room(
+            api.DeleteRoomRequest(
+                room=ctx.room.name,
+            )
+        )
+        logger.info(f"[end_call] Room deleted: {ctx.room.name}")
+    except Exception as e:
+        logger.warning(f"[end_call] delete_room failed: {e}. Trying remove_participant by identity…")
+        try:
+            identity = CURRENT_PARTICIPANT.get(None) or ""
+            if identity:
+                await ctx.api.room.remove_participant(
+                    api.RemoveParticipantRequest(
+                        room=ctx.room.name,
+                        identity=identity,
+                    )
+                )
+                logger.info(f"[end_call] Removed participant identity={identity}")
+            else:
+                logger.error("[end_call] No participant identity available to remove.")
+        except Exception as e2:
+            logger.exception(f"[end_call] remove_participant failed: {e2}")
 
 @function_tool
 async def save_name(name: str) -> str:
-    """Store validated patient name in Redis with detailed logging."""
     ctx = _ctx()
-    
+
     try:
-        # ✅ Validate name via Pydantic
+        # Block name saving in reschedule flow
+        if ctx.mode == "reschedule":
+            return "You're rescheduling your appointment. Tell me the new date and time you want to move it to."
+
+        # Block name saving in cancel flow
+        if ctx.mode == "cancel":
+            return "You're cancelling your appointment. I only need your phone number to find your record."
+
+        # Validate name
         validated = BookingBase(name=name)
-        ctx.name = validated.name.strip().title()
-
-        # ✅ Save updated context
+        ctx.name = validated.name
         _save(ctx)
-        logger.info(f"[save_name] ✅ Saved context fo {ctx}")
 
-        return f"Got it, {ctx.name}."
+        return f"Thanks, {ctx.name}."
 
     except ValidationError as e:
-        logger.warning(f"[save_name] ❌ Validation failed for name={name!r}: {e}")
-        return "I might have misheard your name. Could you please repeat it clearly?"
+        logger.warning(f"[save_name] validation_failed name={name!r} error={e}")
+        return "I didn't catch that clearly. Please say your name again."
 
     except Exception as e:
-        logger.exception(f"[save_name] 💥 Unexpected error while saving name: {e}")
-        return "Sorry, something went wrong while saving your name. Could you repeat it?"
+        logger.exception(f"[save_name] unexpected_error name={name!r} error={e}")
+        return "Sorry, something went wrong. Please repeat your name."
 
 
 @function_tool
@@ -93,178 +132,202 @@ def parse_time_range(text: str):
 @function_tool
 async def available_slot(day: str = "", date: str = "", time: str = "") -> str:
     """
-    Suggest appointment slots conversationally.
-    Supports 'morning', 'afternoon', 'evening', and specific hour ranges.
+    Suggest available appointment slots for a given day.
+    - Understands natural language ("tomorrow", "morning", "after 2pm")
+    - Always fetches fresh availability from DB.
+    - Returns top 3 free slots.
+    - Stores them in ctx.suggested_slots for booking_appointment.
     """
+
     ctx = _ctx()
+    logger.info(f"[available_slot] ▶ Input: day={day!r}, date={date!r}, time={time!r}")
+
+    # -------------------------------------------
+    # 1️⃣ Resolve target date naturally
+    # -------------------------------------------
     today = datetime.now()
     user_text = " ".join(filter(None, [day, date, time])).lower().strip()
-    logger.info(f"[available_slot] 🧠 User said: {user_text!r}")
 
-    # Detect date
     if "today" in user_text:
-        target_date = today
+        target = today
     elif "tomorrow" in user_text:
-        target_date = today + timedelta(days=1)
+        target = today + timedelta(days=1)
     else:
         try:
-            target_date = datetime.strptime(date, "%Y-%m-%d")
+            target = datetime.strptime(date, "%Y-%m-%d")
         except Exception:
-            target_date = today
+            # fallback: nearest future day
+            target = today
 
-    formatted_date = target_date.strftime("%Y-%m-%d")
-    spoken_day = target_date.strftime("%A, %B %d")
+    if target.date() < today.date():
+        return "I can't book for past dates. Please choose a future date."
 
-    # Define all working slots
-    all_slots = [
+    if target > today + timedelta(days=30):
+        return "I can book up to 30 days ahead. Please give a closer date."
+
+    ctx.date = target.strftime("%Y-%m-%d")
+    _save(ctx)
+
+    spoken_day = target.strftime("%A, %B %d")
+
+    # -------------------------------------------
+    # 2️⃣ Base clinic working hours
+    # -------------------------------------------
+    ALL_SLOTS = [
         "9:00 AM", "9:30 AM", "10:00 AM", "10:30 AM",
         "11:00 AM", "11:30 AM", "12:00 PM",
         "1:00 PM", "1:30 PM", "2:00 PM", "2:30 PM",
         "3:00 PM", "3:30 PM", "4:00 PM"
     ]
 
-    # Keyword filtering
-    if "morning" in user_text:
-        slots = [s for s in all_slots if "AM" in s]
-    elif "afternoon" in user_text:
-        slots = [s for s in all_slots if "PM" in s and int(s.split(':')[0]) < 4]
-    elif "evening" in user_text:
-        slots = [s for s in all_slots if "PM" in s and int(s.split(':')[0]) >= 4]
+    # -------------------------------------------
+    # 3️⃣ Natural filtering (morning/evening etc.)
+    # -------------------------------------------
+    lower = user_text.lower()
+    filtered = ALL_SLOTS.copy()
+
+    if "morning" in lower:
+        filtered = [s for s in ALL_SLOTS if "AM" in s]
+    elif "afternoon" in lower:
+        filtered = [s for s in ALL_SLOTS if "PM" in s and int(s.split(":")[0]) < 4]
+    elif "evening" in lower:
+        filtered = [s for s in ALL_SLOTS if "PM" in s and int(s.split(":")[0]) >= 4]
     else:
-        # Parse specific time or range
-        start, end = parse_time_range(user_text)
-        if start:
-            def slot_to_24h(slot):
-                h, m = map(int, re.findall(r"\d+", slot))
-                if "PM" in slot and h != 12:
-                    h += 12
-                elif "AM" in slot and h == 12:
-                    h = 0
-                return h, m
+        # Time-based filtering (e.g., "after 2")
+        try:
+            numbers = re.findall(r"\d+", lower)
+            if numbers:
+                hour = int(numbers[0])
+                filtered = [s for s in ALL_SLOTS if int(s.split(":")[0]) >= hour]
+        except:
+            pass
 
-            slots = []
-            for s in all_slots:
-                sh, sm = slot_to_24h(s)
-                if end:
-                    # Range case: e.g. between 2:00 PM and 3:00 PM
-                    if (sh, sm) >= start and (sh, sm) <= end:
-                        slots.append(s)
-                else:
-                    # Single hour ±30 min window
-                    start_h, start_m = start
-                    if abs((sh * 60 + sm) - (start_h * 60 + start_m)) <= 30:
-                        slots.append(s)
+    # -------------------------------------------
+    # 4️⃣ Remove already booked slots (live DB)
+    # -------------------------------------------
+    booked = get_booked_slots(ctx.date) or []
+    logger.info(f"[available_slot] Booked slots for {ctx.date}: {booked}")
 
-            if not slots:
-                slots = all_slots  # fallback
+    fresh_available = [s for s in filtered if s not in booked]
 
-        else:
-            slots = all_slots
+    # If the user filtered too much & no slots remain → fallback to all free slots
+    if not fresh_available:
+        fresh_available = [s for s in ALL_SLOTS if s not in booked]
 
-    # Save suggestions to Redis
-    ctx.suggested_slots = slots[:3]
-    ctx.date = formatted_date
+    # Still empty → fully booked
+    if not fresh_available:
+        return f"All slots on {spoken_day} are full. Would you like another day?"
+
+    # -------------------------------------------
+    # 5️⃣ Pick top 3 best options
+    # -------------------------------------------
+    top3 = fresh_available
+    ctx.suggested_slots = top3
     _save(ctx)
-    logger.info(f"[available_slot] 💾 Saved to Redis → {ctx}")
 
-    # Build natural response
-    readable = ", ".join(ctx.suggested_slots[:-1]) + f", or {ctx.suggested_slots[-1]}" if len(ctx.suggested_slots) > 1 else ctx.suggested_slots[0]
-    return f"On {spoken_day}, I have {readable} available. Which one would you like to book?"
+    if len(top3) == 1:
+        readable = top3[0]
+    else:
+        readable = ", ".join(top3[:-1]) + f", or {top3[-1]}"
+
+    logger.info(f"[available_slot] Final suggestions: {top3}")
+
+    return f"On {spoken_day}, I have {readable} available. Which time works best for you?"
 
 @function_tool
 async def booking_appointment(time: str = "") -> str:
     """
-    Confirm or reschedule an appointment.
-    Async + production-safe version.
+    Final booking step: create the appointment.
+    Assumes:
+    - name is known
+    - phone is known
+    - date is set
+    - time is set
+    LLM handles all questioning BEFORE calling this tool.
     """
-    ctx = _ctx()
+
+    ctx = _ctx()  # Redis session memory
+    if time:
+        ctx.time = time
 
     try:
-        # 0️⃣ Require phone before booking
-        if not ctx.phone or len(ctx.phone.strip()) < 10:
-            return (
-                "Before booking, I’ll need your phone number to confirm your appointment. "
-                "Could you please share your contact number?"
-            )
+        # -----------------------------
+        # 1️⃣ Validate required fields
+        # -----------------------------
+        if not ctx.phone:
+            return "I still need your phone number."
 
-        # 1️⃣ Determine selected time
-        selected_time = time or (ctx.suggested_slots[0] if ctx.suggested_slots else None)
-        if not selected_time:
-            return "I don’t have a time selected yet. Which slot would you like to book?"
+        if not ctx.name:
+            return "I still need your name."
 
-        greeting = ""
-        patient_data = None
+        if not ctx.date:
+            return "I still need the date."
 
-        # 2️⃣ Query DB safely inside context
+        if not ctx.time:
+            return "I still need the time."
+
+        selected_time = ctx.time
+
+        # -----------------------------
+        # 2️⃣ Fetch or create patient
+        # -----------------------------
         with db_context():
-            existing_patient = get_patient_by_phone(ctx.phone)
+            patient = get_patient_by_phone(ctx.phone)
 
-            if existing_patient:
-                patient_data = {
-                    "id": existing_patient.id,
-                    "name": existing_patient.name,
-                }
-                logger.info(f"[booking_appointment] Returning patient: {patient_data['name']}")
-            else:
-                new_patient = get_or_create_patient(ctx.name, ctx.phone)
-                patient_data = {
-                    "id": new_patient.id,
-                    "name": new_patient.name,
-                }
-                greeting = f"Got it, {ctx.name}. I’ve created your new record. "
-                logger.info(f"[booking_appointment] New patient: {patient_data['name']}")
+            if not patient:
+                # Create new patient
+                patient = get_or_create_patient(ctx.name, ctx.phone)
+                logger.info(f"[booking] Created new patient: {patient}")
 
-            # 3️⃣ Prevent duplicate same-day bookings
-            existing_appt = (
-                Appointment.query.filter_by(patient_id=patient_data["id"], date=ctx.date).first()
-            )
+            patient_id = patient["id"]
 
-            if existing_appt:
-                if existing_appt.time == selected_time:
+            # -----------------------------
+            # 3️⃣ Check if appointment exists
+            # -----------------------------
+            existing = Appointment.query.filter_by(
+                patient_id=patient_id,
+                date=ctx.date
+            ).first()
+
+            if existing:
+                if existing.time == selected_time:
                     return (
-                        f"You already have an appointment on {ctx.date} at {existing_appt.time}. "
-                        "Would you like to reschedule?"
+                        f"You already have an appointment on {ctx.date} at {selected_time}. "
+                        "Would you like to change it?"
+                    )
+                else:
+                    return (
+                        f"You have an appointment on {ctx.date} at {existing.time}. "
+                        f"Should I move it to {selected_time}?"
                     )
 
-                # Reschedule
-                existing_appt.time = selected_time
-                existing_appt.status = "Rescheduled"
-                db.session.commit()
-                ctx.time = selected_time
-                ctx.status = "rescheduled"
-                _save(ctx)
-                return (
-                    f"{greeting}Your appointment has been rescheduled to {ctx.date} at {selected_time}. "
-                    "We’ll send you a confirmation shortly."
-                )
-
-            # 4️⃣ Create new appointment
-            new_appt = Appointment(
-                patient_id=patient_data["id"],
+            # -----------------------------
+            # 4️⃣ Create appointment
+            # -----------------------------
+            new_appt = create_appointment(
+                patient_id=patient_id,
                 date=ctx.date,
-                time=selected_time,
-                status="Booked",
-                created_at=datetime.utcnow(),
+                time=selected_time
             )
-            db.session.add(new_appt)
-            db.session.commit()
 
-        # 5️⃣ Update Redis (non-blocking)
-        ctx.time = selected_time
-        ctx.status = "booked"
+            logger.info(f"[booking] Appointment created: {new_appt}")
+
+
+
+
+        ctx.status = "BOOKED"
+        ctx.stage = "DONE"
+
         asyncio.create_task(asyncio.to_thread(_save, ctx))
 
-        logger.info(f"[booking_appointment] ✅ Booked {ctx.name} at {ctx.date} {ctx.time}")
-
         return (
-            f"{greeting}"
-            f"Your appointment has been booked for {ctx.date} at {ctx.time}. "
-            "We’ll send you a confirmation shortly."
+            f"Your appointment is confirmed for {ctx.date} at {selected_time}. "
+            "Anything else you need?"
         )
 
     except Exception as e:
-        logger.error(f"[booking_appointment] ❌ Error: {e}")
-        return "Sorry, something went wrong while booking your appointment."
+        logger.error(f"[booking] ❌ Error: {e}")
+        return "Sorry, I couldn't complete the booking. Please try again."
 
 
 @function_tool
@@ -273,7 +336,130 @@ async def get_date():
     return f"Today's date is {datetime.now().strftime('%A, %B %d, %Y %I:%M %p')}"
 
 
+@function_tool
+async def update_caller_profile(name: Optional[str] = None, phone: Optional[str] = None) -> str:
+    """
+    Persist caller profile (name/phone) for future calls without disrupting session.
+    If phone not provided, uses current session phone if available.
+    """
+    ctx = _ctx()
+    target_phone = (phone or ctx.phone or "").strip()
+    target_name = (name or ctx.name or "").strip()
+
+    if not target_phone:
+        return "I need a phone number to update your profile. What’s your number?"
+
+    try:
+        profile = upsert_caller_profile(phone=target_phone, name=target_name or None)
+        # Merge back to session for immediate continuity
+        if target_name:
+            ctx.name = target_name.title()
+        ctx.phone = profile.phone
+        _save(ctx)
+        if target_name:
+            return f"Okay, I’ll remember {ctx.name} for next time."
+        return "Okay, I’ll remember your details for next time."
+    except Exception as e:
+        logger.exception(f"[update_caller_profile] Failed: {e}")
+        return "Sorry, I couldn’t update your profile right now."
+
+@function_tool
+async def confirm_reschedule(time: str = "") -> str:
+    """
+    Confirm and perform rescheduling to the selected date/time.
+    Use after start_reschedule + available_slot when the caller says 'yes'.
+    """
+    ctx = _ctx()
+
+    if not ctx.phone:
+        return "I need your phone number to find your appointment. What’s your number?"
+
+    if not ctx.date:
+        return "Which date should I move your appointment to?"
+
+    # Determine the target time
+    selected_time = time or (ctx.suggested_slots[0] if ctx.suggested_slots else ctx.time)
+    if not selected_time:
+        return "Which time should I move it to?"
+
+    with db_context():
+        patient = get_patient_by_phone(ctx.phone)
+        if not patient:
+            return "we don't have your record,do you want to book a new one?"
+
+        upcoming = get_upcoming_appointment(patient["id"])
+        if not upcoming:
+            return "I don’t see an upcoming appointment to move. Should I book a new one instead?"
+
+        old_date, old_time = str(upcoming.date), upcoming.time
+        reschedule_appointment(upcoming.id, ctx.date, selected_time)
+
+    ctx.time = selected_time
+    ctx.status = "rescheduled"
+    _save(ctx)
+
+    return (
+        f"Done. I’ve moved your appointment from {old_date} at {old_time} "
+        f"to {ctx.date} at {selected_time}. Anything else I can help with?"
+    )
+@function_tool
+async def end_call() -> str:
+    """
+    Gracefully end the call after confirming there's nothing else needed.
+    Does not clear Redis; short-term memory expires via TTL.
+    """
+    async def _delayed_hangup():
+        try:
+            await asyncio.sleep(1.0)  # allow TTS to finish
+            await hangup_call()
+        except Exception as e:
+            logger.exception(f"[end_call] Hangup task failed: {e}")
+    asyncio.create_task(_delayed_hangup())
+    return "Thanks for calling Shifa Clinic. Goodbye."
+
 import re
+
+
+
+@function_tool 
+async def start_reschedule() -> str:
+    ctx = _ctx()
+
+    if not ctx.phone:
+        return "Sure, I can help with that. Can you confirm your phone number first?"
+
+    with db_context():
+        patient = get_patient_by_phone(ctx.phone)
+
+        if not patient:
+            return "I couldn’t find your record. Can you share your name?"
+
+        upcoming = get_upcoming_appointment(patient["id"])
+
+        if not upcoming:
+            return "You don’t have any upcoming appointment. Would you like to book a new one?"
+
+        # Convert date
+        try:
+            old_date = datetime.strptime(upcoming.date, "%Y-%m-%d").strftime("%B %d")
+        except:
+            old_date = upcoming.date  # fallback
+
+        # Format time nicely
+        try:
+            old_time = datetime.strptime(upcoming.time, "%H:%M").strftime("%I:%M %p")
+        except:
+            old_time = upcoming.time
+
+        ctx.old_date = old_date
+        ctx.old_time = old_time
+        ctx.mode = "reschedule"
+        _save(ctx)
+
+        return f"I found your appointment on {old_date} at {old_time}. What date and time would you like to move it to?"
+
+    
+
 
 class BookingBase(BaseModel):
     name: Optional[str] = Field(None, description="Customer name")     
@@ -297,6 +483,8 @@ class BookingBase(BaseModel):
             raise ValueError("Invalid phone number format.")
         return clean
 
+
+
 class BookingCreate(BookingBase):
     date: str = Field(..., description="Appointment date in YYYY-MM-DD format")
     time: str = Field(..., description="Appointment time in HH:MM format (24-hour)")
@@ -314,3 +502,4 @@ class BookingCreate(BookingBase):
         if not re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", v):
             raise ValueError("Time must be in format HH:MM (24-hour).")
         return v
+

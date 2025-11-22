@@ -21,5 +21,7 @@ def create_app() -> Flask:
     with app.app_context():
         from src.models.patient_db import Patient  # noqa: F401
         from src.models.appointments_db import Appointment  # noqa: F401
+        # Ensure tables exist (useful for SQLite/dev). For production, prefer migrations.
+        db.create_all()
 
     return app

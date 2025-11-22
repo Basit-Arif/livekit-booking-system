@@ -22,11 +22,33 @@ def _ctx() -> BookingContext:
 
 # 💾 Save context back to Redis
 def _save(ctx: BookingContext):
-    pid = CURRENT_PARTICIPANT.get(None)
-    if not pid:
+    caller_id = CURRENT_PARTICIPANT.get()
+    if not caller_id:
         return
-    save_context(pid, ctx)
-    logger.info(f"[Redis] Saved context for {pid}: {ctx}")
+
+    # Load old context (if it exists)
+    old = load_context(caller_id)
+
+    if not old:
+        # No existing context → simply save entire object
+        save_context(caller_id, ctx)
+        logger.info(f"[Redis] Saved NEW context for {caller_id}: {ctx}")
+        return
+
+    # Convert dataclasses to dicts
+    old_dict = asdict(old)
+    new_dict = asdict(ctx)
+
+    # Merge dictionaries: only update non-None values
+    for key, value in new_dict.items():
+        if value is not None:
+            old_dict[key] = value
+
+    # Create a new merged BookingContext object
+    merged = BookingContext(**old_dict)
+
+    save_context(caller_id, merged)
+    logger.info(f"[Redis] Saved MERGED context for {caller_id}: {merged}")
 
 # 🧹 Clear context from Redis
 def _clear():
