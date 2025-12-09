@@ -2,42 +2,72 @@
 
 `Voice-Agent-PSTN` is a production-style voice receptionist for clinics.
 
-It connects to **LiveKit** to answer real phone calls, books / reschedules / cancels appointments, and exposes a clean **Flask dashboard** where human staff can manage patients, bookings, and see live call activity.
+It connects to **LiveKit** to answer real phone calls, books / reschedules / cancels appointments, and provides a clean **Flask dashboard** where staff can manage patients, appointments, and monitor live calls.
 
 ---
 
-### Key Features
+### Why this project?
+
+Traditional phone reception is:
+
+- Hard to scale during peak hours.
+- Error‑prone when staff are busy.
+- Expensive outside normal clinic times.
+
+This project gives you:
+
+- An **AI receptionist** that answers every call.
+- A **single source of truth** for patients and appointments.
+- A **simple web UI** where humans stay in control.
+
+---
+
+### Core Features
 
 - **AI Phone Receptionist (LiveKit + LLM)**
   - Handles inbound PSTN calls in real time.
-  - Collects caller **name** and **phone**, then books new appointments, reschedules, or cancels.
-  - Maintains Redis-backed **session context** and **long‑term caller profiles**.
+  - Collects caller **name** and **phone number**.
+  - Books new appointments, reschedules existing ones, or cancels.
+  - Uses Redis-backed **BookingContext** for per-call state and **CallerProfile** for memory across calls.
 
 - **Receptionist Web Dashboard (Flask)**
-  - Clean, responsive UI in HTML + CSS + vanilla JavaScript.
-  - **Overview**: today’s appointment stats and high-level KPIs.
-  - **Appointments** tab: full CRUD for bookings (create / edit / delete).
-  - **Patients** tab: searchable patient directory with full CRUD.
-  - **Live Calls** panel: shows active calls, booking stage, requested slot, and how long the call has been running.
+  - Responsive, clean UI – HTML + CSS + vanilla JS (no heavy framework).
+  - **Overview**:
+    - Total patients.
+    - Today’s appointments.
+    - Booked / Pending / Rescheduled / Cancelled counts.
+  - **Appointments** tab:
+    - Full CRUD: create, edit, delete bookings.
+    - Modal form with patient selector, date, time, and status.
+  - **Patients** tab:
+    - Search by name/phone.
+    - Full CRUD: add, edit, delete patients.
+  - **Live Calls** panel:
+    - See active AI calls, current stage, requested slot, and how long they’ve been running.
 
-- **Solid Backend Design**
-  - SQLAlchemy models for `Patient` and `Appointment` with Flask‑Migrate migrations.
-  - Service layer (`clinic_service`, `redis_service`) encapsulates DB and Redis logic.
-  - LiveKit tools kept in `src/routes/livekit/tools.py` for a clear, testable agent API.
+- **Backend & Persistence**
+  - SQLAlchemy models for `Patient` and `Appointment`.
+  - Flask‑Migrate / Alembic migration setup.
+  - `clinic_service` encapsulates all DB logic around appointments and patients.
+  - `redis_service` encapsulates Redis usage and session listing for the dashboard.
 
 ---
 
 ### Tech Stack
 
-- **Backend**
+- **Runtime**
   - Python 3.11+
-  - Flask, Flask‑SQLAlchemy, Flask‑Migrate
-  - Redis (session + caller profile store)
+
+- **Backend**
+  - Flask
+  - Flask‑SQLAlchemy
+  - Flask‑Migrate
+  - Redis
   - LiveKit Agents SDK + plugins (STT / LLM / TTS)
 
 - **Frontend**
   - Jinja2 templates
-  - Hand‑crafted HTML, CSS, and JavaScript (no frontend framework required)
+  - HTML, CSS, JavaScript
 
 ---
 
@@ -49,18 +79,21 @@ Voice-Agent-PSTN/
 
   src/
     app_factory.py           # create_app(): Flask + DB + blueprints
+
     models/
       patient_db.py          # Patient model
       appointments_db.py     # Appointment model
+
     routes/
       livekit/
-        main.py              # Agent configuration (LLM, tools, entrypoint)
-        tools.py             # Function tools for booking / reschedule / cancel
-      dashboard.py           # HTTP routes for dashboard + CRUD endpoints
+        main.py              # Voice agent setup (LLM, tools, entrypoint)
+        tools.py             # Tools: save_name, save_phone, booking_appointment, etc.
+      dashboard.py           # HTTP routes for dashboard & CRUD
+
     services/
       clinic_service.py      # Patient + appointment business logic
       redis_service.py       # BookingContext, CallerProfile, live sessions
-      db_context.py          # Context manager for DB operations
+      db_context.py          # Context manager for DB sessions
       context_manager.py     # LiveKit ↔ BookingContext helpers
 
   src/templates/
@@ -85,7 +118,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e .3. **Configure environment**
 
-Create a `.env` file in the project root (or export these in your shell):
+Create a `.env` file in the project root (or export equivalent env vars):
 
 FLASK_ENV=development
 
@@ -98,98 +131,118 @@ LIVEKIT_API_KEY=...
 LIVEKIT_API_SECRET=...
 
 OPENAI_API_KEY=...
-# etc.Make sure Redis is running:
+# etc.Ensure Redis is running locally:
 
 redis-server---
 
 ### Running the System
 
-You typically run **two processes**: one for the **AI worker** and one for the **dashboard**.
+You typically run **two processes**: the LiveKit worker and the Flask dashboard.
 
 #### 1. LiveKit worker (AI receptionist)
 
 cd /path/to/Voice-Agent-PSTN
 uv run livekit_worker.pyThis process:
 
-- Connects to LiveKit.
+- Connects to your LiveKit server.
 - Waits for incoming calls.
-- Runs the voice agent defined in `src/routes/livekit/main.py`.
-- Uses tools from `src/routes/livekit/tools.py` to read/write patients and appointments.
+- Runs the agent defined in `src/routes/livekit/main.py`.
+- Uses the tools in `src/routes/livekit/tools.py` for all booking / reschedule / cancel logic.
 
 #### 2. Flask dashboard
 
 cd /path/to/Voice-Agent-PSTN
-uv run main.pyOpen in your browser:
+uv run main.pyThen open:
 
-http://localhost:5001/You will see:
+http://localhost:5001/You’ll have:
 
-- **Overview**: KPIs (total patients, today’s appointments, breakdown by status).
-- **Appointments**: full-width table with **Add / Edit / Delete** (modal-based).
-- **Patients**: searchable list with **Add / Edit / Delete**.
-- **Live Calls**: table of active call sessions from Redis.
+- **Overview** – summary cards and today’s schedule.
+- **Appointments** – full-width table with Add / Edit / Delete.
+- **Patients** – searchable list with Add / Edit / Delete.
+- **Live Calls** – real-time view of current AI calls.
 
 ---
 
-### Dashboard Capabilities
+### Dashboard Details
 
-- **Patients**
-  - Add patients from the Patients tab or via sidebar “+ New patient”.
-  - Edit and delete via row actions, with confirmation prompts.
-  - All persisted in the `patients` table via `clinic_service`.
+#### Patients
 
-- **Appointments**
-  - Add appointments from Appointments tab or via sidebar “+ New appointment”.
-  - Choose existing patient, date, time, and status (Booked / Pending / Rescheduled / Cancelled).
-  - Edit and delete existing appointments with confirmation.
+- Add patients using:
+  - “+ New patient” in the sidebar, or
+  - “+ Add patient” in the Patients panel.
+- Edit:
+  - Opens a modal pre-filled with current name / phone / email.
+- Delete:
+  - Pops a confirm dialog, then deletes via `POST /patients/<id>/delete`.
 
-- **Live Calls**
-  - Uses `list_active_sessions()` in `redis_service` to read `context:*` keys.
-  - Shows:
-    - Caller name / phone (if known),
-    - Current `stage` (e.g. `start`, `collecting_phone`, `booking`, `rescheduling`),
-    - Requested date/time slot,
-    - “Started ago” (e.g. “3 min ago”).
+#### Appointments
+
+- Add appointments using:
+  - “+ New appointment” in the sidebar, or
+  - “+ Add appointment” in the Appointments panel.
+- Choose:
+  - Existing patient,
+  - Date (`YYYY-MM-DD`),
+  - Time (`e.g. 10:30 am`),
+  - Status (Booked / Pending / Rescheduled / Cancelled).
+- Edit / Delete:
+  - Row actions with confirmation before destructive actions.
+
+#### Live Calls
+
+- Backed by `list_active_sessions()` in `redis_service.py`.
+- Shows, per active call:
+  - Caller name and phone (if known),
+  - Current booking `stage`,
+  - Current `status`,
+  - Requested `date` / `time` (if already provided),
+  - How long ago the call started.
 
 ---
 
 ### Tests
 
-Run tests with:
+Run the test suite with:
 
 uv run pytest
 # or
-pytestThe `tests/` directory includes unit tests; you can extend it with more coverage around tools and booking logic as you harden the agent.
+pytestExtend `tests/` with additional coverage as you modify booking rules or LiveKit tools.
 
 ---
 
 ### Configuration Notes
 
 - **Database**
-  - Default: SQLite (`instance/clinic.db`) for local development.
-  - Migrations managed by Flask‑Migrate / Alembic in `migrations/`.
-  - For production, configure Postgres/MySQL in `config.py`, run migrations, and point `SQLALCHEMY_DATABASE_URI` there.
+  - Default: SQLite at `instance/clinic.db` for local development.
+  - Migrations managed via Flask‑Migrate / Alembic in `migrations/`.
+  - For production, update `config.py` to use Postgres/MySQL and run migrations.
 
-- **Timezones & Slots**
-  - Timezone and working-hour logic live in `clinic_service.py`.
-  - Booking tools should:
-    - Reject **past** date/time slots for new bookings.
-    - Use `get_booked_slots` to avoid double‑booking.
-    - Suggest a new slot when requested time is unavailable (configurable).
+- **Timezones & Appointment Rules**
+  - Timezone (e.g. `Asia/Karachi`) and time-slot logic live in `clinic_service.py`.
+  - Booking tools are designed to:
+    - Reject **past** date/time slots for new appointments.
+    - Respect clinic working hours.
+    - Check `get_booked_slots` to avoid double-booking.
+    - Suggest alternative slots when a requested time is unavailable.
 
 ---
 
 ### Security & Production
 
-- Run Flask behind a production WSGI server (Gunicorn, uWSGI) and a reverse proxy (Nginx).
-- Store all API keys and secrets in environment variables or a secret manager.
-- Always use HTTPS for the dashboard and LiveKit server URLs.
-- Add auth (login) to the dashboard if it is reachable from outside your internal network.
-- Review CORS, CSRF, and rate-limiting settings before exposing publicly.
+Before putting this into production:
+
+- Run Flask under Gunicorn/uWSGI behind Nginx (HTTPS).
+- Keep API keys and secrets out of source control (env vars / secret manager only).
+- Protect the dashboard with authentication if it’s not strictly internal.
+- Review:
+  - CORS / CSRF,
+  - Rate-limiting for APIs,
+  - Logging and monitoring.
 
 ---
 
 ### License
 
-Specify your license here, for example:
+Specify your license, for example:
 
 MIT License – see LICENSE for details.
