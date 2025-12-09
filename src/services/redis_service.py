@@ -2,7 +2,7 @@ import os, json
 import redis
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict
 from src.models.patient_db import Patient
 from src.models import Appointment
 from src.services.db_context import db_context
@@ -134,6 +134,7 @@ class BookingContext:
     new_time: str | None = None
     reschedule_confirmed: bool = False
     confirmed_identity: bool = False
+    cancel_appt_id: int | None = None
 
     # Metadata
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -230,3 +231,71 @@ def hydrate_context(caller_id: str, phone: str | None = None) -> BookingContext:
 
     print(f"[Hydrate] 💾 Session hydrated for {caller_id}")
     return session
+
+
+def list_active_sessions() -> List[Dict]:
+    """
+    Return a list of active call sessions from Redis for the dashboard.
+
+    Each item includes:
+    - participant_id
+    - name / phone
+    - stage / status
+    - date / time (if known)
+    - created_at and a human "started_ago" string
+    """
+    sessions: List[Dict] = []
+
+    try:
+        for key in r.scan_iter("context:*"):
+            raw = r.get(key)
+            if not raw:
+                continue
+
+            try:
+                data = json.loads(raw)
+                ctx = BookingContext(**data)
+            except Exception:
+                continue
+
+            # participant_id is everything after "context:"
+            participant_id = key.split(":", 1)[1] if ":" in key else key
+
+            # Derive best date/time representation
+            date = ctx.date or ctx.new_date or ctx.old_date
+            time = ctx.time or ctx.new_time or ctx.old_time
+
+            started_ago = ""
+            try:
+                created_dt = datetime.fromisoformat(ctx.created_at)
+                delta = datetime.utcnow() - created_dt
+                secs = int(delta.total_seconds())
+                if secs < 60:
+                    started_ago = "Just now"
+                elif secs < 3600:
+                    started_ago = f"{secs // 60} min ago"
+                else:
+                    started_ago = f"{secs // 3600} hr ago"
+            except Exception:
+                started_ago = ""
+
+            sessions.append(
+                {
+                    "participant_id": participant_id,
+                    "name": ctx.name,
+                    "phone": ctx.phone,
+                    "stage": ctx.stage,
+                    "status": ctx.status,
+                    "date": date,
+                    "time": time,
+                    "created_at": ctx.created_at,
+                    "started_ago": started_ago,
+                }
+            )
+    except Exception:
+        # For dashboard display, it's fine to fail silently and show no sessions.
+        return []
+
+    # Sort newest first
+    sessions.sort(key=lambda s: s.get("created_at") or "", reverse=True)
+    return sessions

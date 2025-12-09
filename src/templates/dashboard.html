@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Clinic Reception Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+    <div class="layout">
+        <aside class="sidebar">
+            <div class="sidebar__brand">
+                <div class="brand__logo">SC</div>
+                <div class="brand__text">
+                    <span class="brand__name">Shifa Clinic</span>
+                    <span class="brand__role">Reception Dashboard</span>
+                </div>
+            </div>
+            <nav class="sidebar__nav">
+                <a
+                    href="{{ url_for('dashboard.dashboard_home') }}"
+                    class="nav__item {% if active_page == 'overview' %}nav__item--active{% endif %}"
+                >
+                    <span class="nav__icon">📊</span>
+                    <span class="nav__label">Overview</span>
+                </a>
+                <a
+                    href="{{ url_for('dashboard.appointments_page') }}"
+                    class="nav__item {% if active_page == 'appointments' %}nav__item--active{% endif %}"
+                >
+                    <span class="nav__icon">🗓</span>
+                    <span class="nav__label">Appointments</span>
+                </a>
+                <a
+                    href="{{ url_for('dashboard.patients_page') }}"
+                    class="nav__item {% if active_page == 'patients' %}nav__item--active{% endif %}"
+                >
+                    <span class="nav__icon">👤</span>
+                    <span class="nav__label">Patients</span>
+                </a>
+            </nav>
+            <div class="sidebar__actions">
+                <button
+                    type="button"
+                    id="sidebar-add-appointment"
+                    class="btn btn--primary btn--full"
+                >
+                    + New appointment
+                </button>
+                <button
+                    type="button"
+                    id="sidebar-add-patient"
+                    class="btn btn--ghost btn--full"
+                >
+                    + New patient
+                </button>
+            </div>
+            <div class="sidebar__footer">
+                <div class="sidebar__meta">
+                    <span class="meta__label">Today</span>
+                    <span class="meta__value">{{ stats.today_label or '—' }}</span>
+                </div>
+                <div class="sidebar__meta">
+                    <span class="meta__label">Timezone</span>
+                    <span class="meta__value">{{ stats.timezone }}</span>
+                </div>
+            </div>
+        </aside>
+
+        <main class="content {% if active_page in ['appointments', 'patients'] %}content--single{% endif %}">
+            <header class="content__header">
+                <div>
+                    <h1 class="content__title">
+                        {% if active_page == 'appointments' %}
+                            Appointments
+                        {% elif active_page == 'patients' %}
+                            Patients
+                        {% else %}
+                            Today’s Schedule
+                        {% endif %}
+                    </h1>
+                    <p class="content__subtitle">
+                        {% if active_page == 'appointments' %}
+                            Managing today’s appointments.
+                        {% elif active_page == 'patients' %}
+                            Managing patient records.
+                        {% else %}
+                            {{ stats.today_total }} appointment{{ '' if stats.today_total == 1 else 's' }} scheduled today.
+                        {% endif %}
+                    </p>
+                </div>
+                <div class="header__meta">
+                    <span class="header__label">Last updated</span>
+                    <span class="header__value">{{ stats.as_of_human or '—' }}</span>
+                </div>
+            </header>
+
+            {% if active_page == 'overview' %}
+                <section class="cards">
+                    <article class="card">
+                        <h2 class="card__title">Total Patients</h2>
+                        <p class="card__value">{{ stats.total_patients }}</p>
+                        <p class="card__hint">Registered in the system</p>
+                    </article>
+
+                    <article class="card">
+                        <h2 class="card__title">Today’s Appointments</h2>
+                        <p class="card__value">{{ stats.today_total }}</p>
+                        <p class="card__hint">All statuses combined</p>
+                    </article>
+
+                    <article class="card card--success">
+                        <h2 class="card__title">Booked</h2>
+                        <p class="card__value">{{ stats.today_booked }}</p>
+                        <p class="card__hint">Confirmed visits</p>
+                    </article>
+
+                    <article class="card card--warning">
+                        <h2 class="card__title">Pending / Rescheduled</h2>
+                        <p class="card__value">
+                            {{ stats.today_pending + stats.today_rescheduled }}
+                        </p>
+                        <p class="card__hint">
+                            {{ stats.today_pending }} pending · {{ stats.today_rescheduled }} rescheduled
+                        </p>
+                    </article>
+                </section>
+            {% endif %}
+
+            <section class="grid">
+                {% if active_page in ['overview', 'appointments'] %}
+                <section class="panel">
+                    <header class="panel__header">
+                        <div>
+                            <h2 class="panel__title">Today’s Appointments</h2>
+                            <p class="panel__subtitle">For {{ stats.today_label or 'today' }}</p>
+                        </div>
+                        <div class="panel__actions">
+                            <button
+                                type="button"
+                                id="open-add-appointment"
+                                class="btn btn--primary"
+                            >
+                                + Add appointment
+                            </button>
+                        </div>
+                    </header>
+
+                    <div class="table-wrapper">
+                        <table class="table" id="appointments-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Patient</th>
+                                    <th>Phone</th>
+                                    <th>Status</th>
+                                    <th class="th--actions">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% if today_appointments %}
+                                    {% for appt in today_appointments %}
+                                        <tr
+                                            data-status="{{ appt.status|lower }}"
+                                            data-appointment-id="{{ appt.id }}"
+                                            data-patient-id="{{ appt.patient.id }}"
+                                            data-date="{{ appt.date }}"
+                                            data-time="{{ appt.time }}"
+                                            data-status-label="{{ appt.status }}"
+                                        >
+                                            <td>{{ appt.time }}</td>
+                                            <td>{{ appt.patient.name }}</td>
+                                            <td>{{ appt.patient.phone }}</td>
+                                            <td>
+                                                <span class="status status--{{ appt.status|lower }}">
+                                                    {{ appt.status }}
+                                                </span>
+                                            </td>
+                                            <td class="table__actions">
+                                                <button
+                                                    type="button"
+                                                    class="btn-icon btn-icon--ghost btn-edit-appointment"
+                                                >
+                                                    Edit
+                                                </button>
+                                                <form
+                                                    method="post"
+                                                    action="{{ url_for('dashboard.delete_appointment_route', appointment_id=appt.id) }}"
+                                                >
+                                                    <button
+                                                        type="button"
+                                                        class="btn-icon btn-icon--danger btn-delete-appointment"
+                                                    >
+                                                        Delete
+                                                    </button>
+                                                </form>
+                                            </td>
+                                        </tr>
+                                    {% endfor %}
+                                {% else %}
+                                    <tr>
+                                        <td colspan="5" class="table__empty">
+                                            No appointments scheduled for today.
+                                        </td>
+                                    </tr>
+                                {% endif %}
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+                {% endif %}
+
+                {% if active_page in ['overview', 'patients'] %}
+                <section class="panel">
+                    <header class="panel__header">
+                        <div>
+                            <h2 class="panel__title">Patients</h2>
+                            <p class="panel__subtitle">Recent patient records</p>
+                        </div>
+                        <div class="panel__actions">
+                            <input
+                                type="text"
+                                id="patient-search"
+                                class="input"
+                                placeholder="Search by name or phone…" />
+                            <button
+                                type="button"
+                                id="open-add-patient"
+                                class="btn btn--primary"
+                            >
+                                + Add patient
+                            </button>
+                        </div>
+                    </header>
+
+                    <div class="table-wrapper">
+                        <table class="table" id="patients-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Phone</th>
+                                    <th>Email</th>
+                                    <th>First Visit</th>
+                                    <th class="th--actions">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% if patients %}
+                                    {% for patient in patients %}
+                                        <tr
+                                            data-name="{{ patient.name|lower }}"
+                                            data-phone="{{ patient.phone|lower }}"
+                                        >
+                                            <td>{{ patient.name }}</td>
+                                            <td>{{ patient.phone }}</td>
+                                            <td>{{ patient.email or '—' }}</td>
+                                            <td>{{ patient.created_at_human or '—' }}</td>
+                                            <td class="table__actions">
+                                                <button
+                                                    type="button"
+                                                    class="btn-icon btn-icon--ghost btn-edit-patient"
+                                                    data-id="{{ patient.id }}"
+                                                    data-name="{{ patient.name }}"
+                                                    data-phone="{{ patient.phone }}"
+                                                    data-email="{{ patient.email or '' }}"
+                                                >
+                                                    Edit
+                                                </button>
+                                                <form
+                                                    method="post"
+                                                    action="{{ url_for('dashboard.delete_patient_route', patient_id=patient.id) }}"
+                                                    class="patient-delete-form"
+                                                >
+                                                    <button
+                                                        type="button"
+                                                        class="btn-icon btn-icon--danger btn-delete-patient"
+                                                    >
+                                                        Delete
+                                                    </button>
+                                                </form>
+                                            </td>
+                                        </tr>
+                                    {% endfor %}
+                                {% else %}
+                                    <tr>
+                                        <td colspan="5" class="table__empty">
+                                            No patients found.
+                                        </td>
+                                    </tr>
+                                {% endif %}
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+                {% endif %}
+            </section>
+
+            {% if live_sessions %}
+            <section class="panel panel--live">
+                <header class="panel__header">
+                    <div>
+                        <h2 class="panel__title">Live Calls</h2>
+                        <p class="panel__subtitle">
+                            {{ live_sessions|length }} active call{{ '' if live_sessions|length == 1 else 's' }}
+                            with the AI receptionist.
+                        </p>
+                    </div>
+                </header>
+
+                <div class="table-wrapper">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Caller</th>
+                                <th>Phone</th>
+                                <th>Stage</th>
+                                <th>Status</th>
+                                <th>Requested Slot</th>
+                                <th>Started</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for s in live_sessions %}
+                                <tr>
+                                    <td>{{ s.name or 'Unknown' }}</td>
+                                    <td>{{ s.phone or '—' }}</td>
+                                    <td>{{ s.stage or '—' }}</td>
+                                    <td>{{ s.status or '—' }}</td>
+                                    <td>
+                                        {% if s.date or s.time %}
+                                            {{ s.date or '—' }} {{ s.time or '' }}
+                                        {% else %}
+                                            —
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ s.started_ago or '—' }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+            {% endif %}
+        </main>
+    </div>
+
+    <!-- Patient create/edit modal -->
+    <div id="patient-modal" class="modal modal--hidden">
+        <div class="modal__backdrop"></div>
+        <div class="modal__panel">
+            <div class="modal__header">
+                <h2 class="modal__title" id="patient-modal-title">Add patient</h2>
+                <button type="button" class="modal__close" id="patient-modal-close">×</button>
+            </div>
+            <form
+                method="post"
+                action="{{ url_for('dashboard.save_patient') }}"
+                class="modal__body"
+                id="patient-form"
+            >
+                <input type="hidden" name="patient_id" id="patient-id" />
+
+                <div class="field">
+                    <label for="patient-name" class="field__label">Full name</label>
+                    <input
+                        type="text"
+                        name="name"
+                        id="patient-name"
+                        class="field__input"
+                        placeholder="Patient name"
+                        required
+                    />
+                </div>
+
+                <div class="field">
+                    <label for="patient-phone" class="field__label">Phone</label>
+                    <input
+                        type="tel"
+                        name="phone"
+                        id="patient-phone"
+                        class="field__input"
+                        placeholder="03xx-xxxxxxx"
+                        required
+                    />
+                </div>
+
+                <div class="field">
+                    <label for="patient-email" class="field__label">Email (optional)</label>
+                    <input
+                        type="email"
+                        name="email"
+                        id="patient-email"
+                        class="field__input"
+                        placeholder="name@example.com"
+                    />
+                </div>
+
+                <div class="modal__footer">
+                    <button
+                        type="button"
+                        class="btn btn--ghost"
+                        id="patient-modal-cancel"
+                    >
+                        Cancel
+                    </button>
+                    <button type="submit" class="btn btn--primary">
+                        Save
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Appointment create/edit modal -->
+    <div id="appointment-modal" class="modal modal--hidden">
+        <div class="modal__backdrop"></div>
+        <div class="modal__panel">
+            <div class="modal__header">
+                <h2 class="modal__title" id="appointment-modal-title">Add appointment</h2>
+                <button type="button" class="modal__close" id="appointment-modal-close">×</button>
+            </div>
+            <form
+                method="post"
+                action="{{ url_for('dashboard.save_appointment') }}"
+                class="modal__body"
+                id="appointment-form"
+            >
+                <input type="hidden" name="appointment_id" id="appointment-id" />
+
+                <div class="field">
+                    <label for="appointment-patient" class="field__label">Patient</label>
+                    <select
+                        id="appointment-patient"
+                        name="patient_id"
+                        class="field__input"
+                        required
+                    >
+                        <option value="">Select existing patient…</option>
+                        {% for patient in patients %}
+                            <option value="{{ patient.id }}">
+                                {{ patient.name }} — {{ patient.phone }}
+                            </option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div class="field-row">
+                    <div class="field">
+                        <label for="appointment-date" class="field__label">Date</label>
+                        <input
+                            type="text"
+                            name="date"
+                            id="appointment-date"
+                            class="field__input"
+                            placeholder="YYYY-MM-DD"
+                            required
+                        />
+                    </div>
+
+                    <div class="field">
+                        <label for="appointment-time" class="field__label">Time</label>
+                        <input
+                            type="text"
+                            name="time"
+                            id="appointment-time"
+                            class="field__input"
+                            placeholder="e.g. 10:30 am"
+                            required
+                        />
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="appointment-status" class="field__label">Status</label>
+                    <select
+                        id="appointment-status"
+                        name="status"
+                        class="field__input"
+                    >
+                        <option value="Booked">Booked</option>
+                        <option value="Pending">Pending</option>
+                        <option value="Rescheduled">Rescheduled</option>
+                        <option value="Cancelled">Cancelled</option>
+                    </select>
+                </div>
+
+                <div class="modal__footer">
+                    <button
+                        type="button"
+                        class="btn btn--ghost"
+                        id="appointment-modal-cancel"
+                    >
+                        Cancel
+                    </button>
+                    <button type="submit" class="btn btn--primary">
+                        Save
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>
+
+

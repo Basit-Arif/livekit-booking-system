@@ -24,4 +24,9 @@ def create_app() -> Flask:
         # Ensure tables exist (useful for SQLite/dev). For production, prefer migrations.
         db.create_all()
 
+        # Register HTTP blueprints
+        from src.routes.dashboard import dashboard_bp
+
+        app.register_blueprint(dashboard_bp)
+
     return app
